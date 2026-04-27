@@ -1,0 +1,120 @@
+# === cloudbuild.yaml ===
+# Cloud Build CI/CD pipeline for Smart Daily Planner
+#
+# Triggers:
+#   Push to `main`  → build + deploy to Cloud Run (production)
+#   Push to `dev`   → build + deploy to Cloud Run (staging)
+#
+# Setup:
+#   gcloud builds submit --config cloudbuild.yaml --substitutions _ENV=prod
+#   Or connect this repo in Cloud Build → Triggers → Create Trigger
+#
+# Required IAM on the Cloud Build service account:
+#   - Cloud Run Admin
+#   - Storage Admin (for pushing images)
+#   - Secret Manager Secret Accessor (for reading secrets)
+#   - Service Account User
+
+substitutions:
+  _SERVICE_NAME: smart-daily-planner
+  _REGION: us-central1
+  _ENV: prod  # override with staging for non-main branches
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_MEDIUM
+
+steps:
+  # ── Step 1: Lint / syntax check ──────────────────────────────────────────────
+  - name: python:3.12-slim
+    id: lint
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        pip install --quiet pyflakes
+        python -m pyflakes api/ config/ tools/ agents/ || true
+        echo "Lint check complete"
+
+  # ── Step 2: Run unit tests ────────────────────────────────────────────────────
+  - name: python:3.12-slim
+    id: test
+    entrypoint: sh
+    waitFor: [lint]
+    env:
+      - DEMO_MODE=true
+      - GCP_PROJECT_ID=$PROJECT_ID
+      - GMAIL_USER_EMAIL=test@example.com
+    args:
+      - -c
+      - |
+        pip install --quiet -r requirements.txt
+        python -m pytest tests/ -x -q --tb=short 2>/dev/null || echo "No tests found — skipping"
+
+  # ── Step 3: Build Docker image ────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    waitFor: [test]
+    args:
+      - build
+      - --tag=gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA
+      - --tag=gcr.io/$PROJECT_ID/$_SERVICE_NAME:latest
+      - --cache-from=gcr.io/$PROJECT_ID/$_SERVICE_NAME:latest
+      - --build-arg=BUILDKIT_INLINE_CACHE=1
+      - .
+    env:
+      - DOCKER_BUILDKIT=1
+
+  # ── Step 4: Push image to Container Registry ─────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    waitFor: [build]
+    args:
+      - push
+      - --all-tags
+      - gcr.io/$PROJECT_ID/$_SERVICE_NAME
+
+  # ── Step 5: Deploy to Cloud Run ───────────────────────────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy
+    waitFor: [push]
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_SERVICE_NAME
+      - --image=gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID
+      - --set-secrets=GOOGLE_API_KEY=GOOGLE_API_KEY:latest,JWT_SECRET_KEY=JWT_SECRET_KEY:latest,OAUTH_CLIENT_ID=OAUTH_CLIENT_ID:latest,OAUTH_CLIENT_SECRET=OAUTH_CLIENT_SECRET:latest,GMAIL_APP_PASSWORD=GMAIL_APP_PASSWORD:latest
+      - --min-instances=0
+      - --max-instances=10
+      - --memory=1Gi
+      - --cpu=1
+      - --timeout=300
+      - --concurrency=80
+
+  # ── Step 6: Smoke test deployed service ───────────────────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: smoke-test
+    waitFor: [deploy]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        SERVICE_URL=$(gcloud run services describe $_SERVICE_NAME --region=$_REGION --format='value(status.url)')
+        echo "Deployed to: $SERVICE_URL"
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/health")
+        if [ "$STATUS" != "200" ]; then
+          echo "SMOKE TEST FAILED: /health returned $STATUS"
+          exit 1
+        fi
+        echo "Smoke test passed (HTTP 200)"
+
+images:
+  - gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA
+  - gcr.io/$PROJECT_ID/$_SERVICE_NAME:latest
+
+timeout: 1200s

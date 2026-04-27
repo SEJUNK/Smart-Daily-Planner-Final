@@ -1,0 +1,107 @@
+# === cloudrun-service.yaml ===
+# Cloud Run service configuration for Smart Daily Planner
+#
+# Deploy:  gcloud run services replace cloudrun-service.yaml --region=us-central1
+# Preview: gcloud run services describe smart-daily-planner --region=us-central1
+#
+# Secrets must be created first:
+#   gcloud secrets create JWT_SECRET_KEY --data-file=- <<< "$(openssl rand -hex 32)"
+#   gcloud secrets create GOOGLE_API_KEY --data-file=- <<< "your-api-key"
+#   gcloud secrets create OAUTH_CLIENT_ID --data-file=- <<< "your-client-id"
+#   gcloud secrets create OAUTH_CLIENT_SECRET --data-file=- <<< "your-client-secret"
+#   gcloud secrets create GMAIL_APP_PASSWORD --data-file=- <<< "your-app-password"
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: smart-daily-planner
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scale to zero when idle — cost efficient
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        # Each instance handles up to 80 concurrent requests
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      # Service account must have: Firestore User, Calendar API, Secret Accessor
+      serviceAccountName: smart-planner-sa@smart-daily-planner-492404.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: gcr.io/smart-daily-planner-492404/smart-daily-planner:latest
+          ports:
+            - name: h2c
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: "0.25"
+              memory: 512Mi
+          env:
+            # Non-secret config
+            - name: GCP_smart-daily-planner-492404
+              value: "smart-daily-planner-492404"
+            - name: GEMINI_MODEL
+              value: "gemini-2.5-flash"
+            - name: DEFAULT_TIMEZONE
+              value: "Asia/Kolkata"
+            - name: GOOGLE_CLOUD_LOCATION
+              value: "us-central1"
+            - name: AUTH_ENABLED
+              value: "true"
+            - name: ENABLE_GMAIL_SEND
+              value: "true"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: ALLOWED_ORIGINS
+              value: "https://YOUR_CLOUD_RUN_URL"
+            - name: APP_URL
+              value: "https://YOUR_CLOUD_RUN_URL"
+            - name: PORT
+              value: "8080"
+            # Secrets via Secret Manager
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_API_KEY
+                  key: latest
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: JWT_SECRET_KEY
+                  key: latest
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: OAUTH_CLIENT_ID
+                  key: latest
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: OAUTH_CLIENT_SECRET
+                  key: latest
+            - name: GMAIL_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: GMAIL_APP_PASSWORD
+                  key: latest
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
